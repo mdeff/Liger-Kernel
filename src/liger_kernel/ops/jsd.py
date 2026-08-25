@@ -43,8 +43,10 @@ def _jsd_kernel(
             for i in range(0, n_cols, BLOCK_SIZE):
                 offsets = i + tl.arange(0, BLOCK_SIZE)
                 tl.store(dX_ptr + offsets, 0.0, mask=offsets < n_cols)
+            tl.store(loss_ptr, 0.0)
             return
 
+    loss_sum = 0.0
     for i in range(0, n_cols, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
@@ -86,8 +88,10 @@ def _jsd_kernel(
         loss = loss * scale
         dX = dX * scale
 
-        tl.store(loss_ptr + offsets, loss, mask=mask)
+        loss_sum += tl.sum(tl.where(mask, loss, 0.0), axis=0)
         tl.store(dX_ptr + offsets, dX, mask=mask)
+
+    tl.store(loss_ptr, loss_sum)
 
 
 MAX_FUSED_SIZE = 4096 if infer_device() == "xpu" else 65536
@@ -97,8 +101,8 @@ def jsd_forward(_input, target, shift_labels, beta, ignore_index, has_label):
     BT, V = _input.shape
     n_rows = BT
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
-    # non reduction loss
-    loss = torch.zeros(_input.shape, dtype=torch.float32, device=_input.device)
+    # Store one reduced FP32 loss per token instead of a full BT x V loss tensor.
+    loss = torch.empty((BT,), dtype=torch.float32, device=_input.device)
     dX = torch.empty_like(_input)
 
     if has_label:
@@ -112,7 +116,7 @@ def jsd_forward(_input, target, shift_labels, beta, ignore_index, has_label):
         Y_ptr=target,  # ground truth in logspace, Y = log P
         Y_stride=target.stride(-2),
         loss_ptr=loss,
-        loss_stride=loss.stride(-2),
+        loss_stride=loss.stride(-1),
         dX_ptr=dX,
         dX_stride=dX.stride(-2),
         label_ptr=(shift_labels if has_label else torch.empty(1, device=_input.device)),  # dummy ptr if no label
